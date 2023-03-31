@@ -1958,47 +1958,97 @@ static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void * rest
     // Horizontal sum of all lanes of the accumulator
     sumf = _mm512_reduce_add_ps( acc0 ) + _mm512_reduce_add_ps( acc1 );
 #elif defined(__AVX2__)
+// Input: 32 Nibbles (16 bytes) at *p0 
+// Output: 2 vectors with 16 values of type int16_t 
+#define EXPAND_32_Q4_NIBBLES_INTO_TWO_M256_VECTORS(OUT_HIGH,OUT_LOW,IN_SRC)     \
+        /* get first input */                                                   \
+        /* Load 16 bytes from memory */                                         \
+        const __m128i tmp_##OUT_HIGH =                                          \
+            _mm_loadu_si128( (const __m128i_u *) IN_SRC);                       \
+                                                                                \
+        /* Expand bytes into uint16_t values */                                 \
+        const __m256i bytes_##OUT_HIGH = _mm256_cvtepu8_epi16(tmp_##OUT_HIGH);  \
+                                                                                \
+        /* Unpack values into individual bytes */                               \
+        const __m256i pre_shift_##OUT_HIGH =                                    \
+            _mm256_andnot_si256( lowMask, bytes_##OUT_HIGH );                   \
+        __m256i OUT_HIGH = _mm256_srli_epi16( pre_shift_##OUT_HIGH, 4 );        \
+                                                                                \
+        __m256i OUT_LOW = _mm256_and_si256( lowMask, bytes_##OUT_HIGH );        \
+        /* Now we have a vector with bytes in [ 0 .. 15 ] interval. 
+           Offset them into [ -8 .. +7 ] interval.  */                          \
+        OUT_HIGH = _mm256_sub_epi16( OUT_HIGH, offset_8 );                      \
+        OUT_LOW = _mm256_sub_epi16( OUT_LOW, offset_8 ); 
+
+
+// Input: 32 Nibbles (16 bytes) at *p0 
+// Output: 2 vectors with 16 values of type int16_t 
+#define GET_SCALE_AND_QUANT_DOT_PRODUCT(SCALE, DOT, INDEX, OFFSET, ACC)\
+        /* Compute combined scale for the block */                              \
+        const __m256 SCALE = _mm256_mul_ps(                                     \
+                    _mm256_broadcast_ss( &x[INDEX+OFFSET].d ),                  \
+                    _mm256_broadcast_ss( &y[INDEX+OFFSET].d ) );                \
+                                                                                \
+        /* Compute the dot product of the quads*/                               \
+        /* Input: 32 Nibbles (16 bytes) at *p0          
+           Output: 2 vectors with 16 values of type int16_t  */                 \
+        EXPAND_32_Q4_NIBBLES_INTO_TWO_M256_VECTORS(                             \
+                x_high_##DOT,                                                   \
+                x_low_##DOT,                                                    \
+                x[INDEX+OFFSET].qs)                                             \
+                                                                                \
+        /* Input: 32 Nibbles (16 bytes) at *p1 
+           Output: 2 vectors with 16 values of type int16_t  */                 \
+        EXPAND_32_Q4_NIBBLES_INTO_TWO_M256_VECTORS(                             \
+                y_high_##DOT,                                                   \
+                y_low_##DOT,                                                    \
+                y[INDEX+OFFSET].qs)                                             \
+                                                                                \
+        /* Compute products of int16_t integers, add pairwise */                \
+        __m256i x_y_high_##DOT =                                                \
+            _mm256_madd_epi16( x_high_##DOT, y_high_##DOT );                    \
+                                                                                \
+        __m256i x_y_low_##DOT =                                                 \
+            _mm256_madd_epi16( x_low_##DOT, y_low_##DOT );                      \
+                                                                                \
+        /* Accumulate products of int16_t integers */                           \
+        __m256i x_y_##DOT = _mm256_add_epi32(                                   \
+                x_y_high_##DOT,                                                 \
+                x_y_low_##DOT );                                                \
+                                                                                \
+        /* Convert int32_t to float*/                                           \
+        __m256 DOT = _mm256_cvtepi32_ps( x_y_##DOT );                           \
+        ACC = _mm256_fmadd_ps( SCALE, DOT, ACC );
+
+
+#define UNROLL_COUNT 8
+
+    // make sure we only unroll multiples of the block count
+    assert(nb % UNROLL_COUNT == 0);
+
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
     // Main loop
-    for (int i = 0; i < nb; ++i) {
-        // Compute combined scale for the block
-        const __m256 d = _mm256_mul_ps( _mm256_broadcast_ss( &x[i].d ), _mm256_broadcast_ss( &y[i].d ) );
+    for (int i = 0; i < nb; i+=UNROLL_COUNT) {
 
-        // Load 16 bytes, and unpack 4 bit fields into bytes, making 32 bytes
-        __m256i bx = bytesFromNibbles( x[i].qs );
-        __m256i by = bytesFromNibbles( y[i].qs );
-
-        // Now we have a vector with bytes in [ 0 .. 15 ] interval. Offset them into [ -8 .. +7 ] interval.
-        const __m256i off = _mm256_set1_epi8( 8 );
-        bx = _mm256_sub_epi8( bx, off );
-        by = _mm256_sub_epi8( by, off );
-
-        // Sign-extend first 16 signed bytes into int16_t
-        __m256i x16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( bx ) );
-        __m256i y16 = _mm256_cvtepi8_epi16( _mm256_castsi256_si128( by ) );
-        // Compute products of int16_t integers, add pairwise
-        __m256i i32 = _mm256_madd_epi16( x16, y16 );
-
-        // Sign-extend last 16 signed bytes into int16_t vectors
-        x16 = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( bx, 1 ) );
-        y16 = _mm256_cvtepi8_epi16( _mm256_extracti128_si256( by, 1 ) );
-        // Accumulate products of int16_t integers
-        i32 = _mm256_add_epi32( i32, _mm256_madd_epi16( x16, y16 ) );
-
-        // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps( i32 );
-        // Apply the scale, and accumulate
-        acc = _mm256_fmadd_ps( d, p, acc );
-    }
+        /* Load 16 bytes, and unpack 4 bit fields into bytes */        
+        const __m256i lowMask = _mm256_set1_epi8( 0xF );
+        const __m256i offset_8 = _mm256_set1_epi16( 8 );
+        
+        // This loop will be unrolled by the compiler
+        for (int u=0;u<UNROLL_COUNT;u++)  {
+            GET_SCALE_AND_QUANT_DOT_PRODUCT(scale, q, i, u, acc);
+        }
+       
+    }   
 
     // Return horizontal sum of the acc vector
     __m128 res = _mm256_extractf128_ps( acc, 1 );
     res = _mm_add_ps( res, _mm256_castps256_ps128( acc ) );
     res = _mm_add_ps( res, _mm_movehl_ps( res, res ) );
     res = _mm_add_ss( res, _mm_movehdup_ps( res ) );
-
+   
     sumf = _mm_cvtss_f32( res );
 #elif defined(__AVX__)
     // Initialize accumulator with zeros
